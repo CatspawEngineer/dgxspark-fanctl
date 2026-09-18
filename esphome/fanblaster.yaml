@@ -1,0 +1,275 @@
+# fanblaster.yaml — M5Stack ATOM Lite を OwlTree ファンコントローラー用の赤外線送信機にする
+#
+# 役割:
+#   - HTTP (web_server の REST) で「目標 %」を受け取り、リモコンと同じ赤外線信号を出す
+#   - ホストからの指示が一定時間途絶えたら自分で 100% を送る (見張り)
+#   - 起動直後にも 100% を送る (停電復帰などの安全側)
+#
+# 送信 LED  : ATOM Lite 内蔵の赤外線 LED (GPIO12)
+# 受信      : M5Stack IR Unit を Grove に接続 (白線 = GPIO32)。リモコンの記録にだけ使う
+#
+# 使い方の流れは README.md を参照。
+# 記録が終わったら substitutions の nec_* を実測値に書き換える。
+
+substitutions:
+  name: fanblaster
+  friendly_name: Fan Blaster
+
+  # ---- リモコンの NEC コード (2026-09-17 実機記録済み) ------------------------
+  # address は全ボタン共通。command はボタンごとに固有。
+  # 実機のボタンは 0/5/10/20/30/40/50/60/70/80/90/100 (5% だけ特殊、以降10刻み)。
+  # 下の number は step:10 のため 5% は daemon/Web UI からは送られない (nec_p5 は記録のみ)。
+  nec_address: "0x5700"
+  nec_p0:   "0x926D"
+  nec_p5:   "0x956A"   # 参考記録のみ。send_pct の配列では使わない
+  nec_p10:  "0x906F"
+  nec_p20:  "0xC43B"
+  nec_p30:  "0xD22D"
+  nec_p40:  "0xC03F"
+  nec_p50:  "0xD12E"
+  nec_p60:  "0xC639"
+  nec_p70:  "0xC23D"
+  nec_p80:  "0xC33C"
+  nec_p90:  "0xC738"
+  nec_p100: "0x827D"
+  nec_display: "0x9867"   # 表示 点灯/消灯 (押すたびに切り替わるので 1 回だけ送る)
+  nec_minus: "0x916E"     # 参考記録のみ。未使用
+  nec_plus:  "0x946B"     # 参考記録のみ。未使用
+
+  # ---- 動作パラメータ -----------------------------------------------------------
+  # daemon 側は変化がなければ resend_interval_s (既定60秒) おきにしか送らないので、
+  # それより十分長い時間 (3倍) を確保する。90秒のままだと無変化のたびに誤検知して 100% になる
+  watchdog_timeout_ms: "180000"   # この時間ホストから指示が来なければ 100% を送る
+  ir_repeat: "2"                 # % ボタンは念のため 2 回送る (直接指定なので何回送っても同じ)
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # 200 = ハードウェア初期化後、Wi-Fi 接続を待たずに実行 (赤外線送信に Wi-Fi は不要)
+    priority: 200
+    then:
+      - delay: 2s
+      - logger.log: "boot: sending full duty as a safe default"
+      - script.execute:
+          id: send_pct
+          pct: 100
+
+esp32:
+  board: m5stack-atom
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+# あとから USB なしで書き換えるため
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # daemon から名前で叩けるように固定 IP を推奨。DHCP 予約でもよい。
+  # manual_ip:
+  #   static_ip: 192.168.1.50
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  ap:
+    ssid: "${name} fallback"
+    password: !secret ap_password
+
+# REST API:
+#   現在値  GET  http://<ip>/number/fan_duty
+#   設定    POST http://<ip>/number/fan_duty/set?value=70
+web_server:
+  port: 80
+  version: 3
+
+globals:
+  - id: last_cmd_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: current_pct
+    type: int
+    restore_value: no
+    initial_value: "100"
+
+remote_transmitter:
+  id: ir_tx
+  pin:
+    number: GPIO12
+    # 内蔵 IR LED が GPIO12 (strapping pin) に付いているのは基板の仕様。警告を抑止
+    ignore_strapping_warning: true
+  carrier_duty_percent: 50%
+  # NEC 1 フレームは約 67ms かかり、non_blocking: false だと送信完了までメインループが止まる。
+  # ESPHome 本体の「50ms 超えたら警告」チェックに毎回引っかかるだけで実害はないが、
+  # true にしてループを塞がない。順序保証はスクリプト側の delay 150ms (>67ms) で足りている。
+  non_blocking: true
+
+# 記録用。IR Unit を外したらこのブロックごとコメントアウトしてよい
+remote_receiver:
+  id: ir_rx
+  pin:
+    number: GPIO32
+    inverted: true
+  # 記録中は all、記録が終わったら空リストにするとログが静かになる (記録済み)
+  dump: []
+  tolerance: 25%
+  idle: 25ms
+
+script:
+  # pct (0..100, 10 刻み) に対応する % ボタンの信号を送る
+  - id: send_pct
+    parameters:
+      pct: int
+    mode: queued
+    then:
+      - lambda: |-
+          int p = pct;
+          if (p < 0) p = 0;
+          if (p > 100) p = 100;
+          p = (p / 10) * 10;
+          id(current_pct) = p;
+          id(last_cmd_ms) = millis();
+          ESP_LOGI("fan", "send %d%%", p);
+      - repeat:
+          count: ${ir_repeat}
+          then:
+            - remote_transmitter.transmit_nec:
+                address: ${nec_address}
+                command: !lambda |-
+                  static const uint16_t cmds[11] = {
+                    ${nec_p0}, ${nec_p10}, ${nec_p20}, ${nec_p30}, ${nec_p40},
+                    ${nec_p50}, ${nec_p60}, ${nec_p70}, ${nec_p80}, ${nec_p90},
+                    ${nec_p100}
+                  };
+                  int i = id(current_pct) / 10;
+                  if (i < 0) i = 0;
+                  if (i > 10) i = 10;
+                  return cmds[i];
+            - delay: 150ms
+
+number:
+  # daemon が叩く入口。スライダーを Web UI から動かしても同じ経路で送信される
+  - platform: template
+    id: fan_duty
+    name: "Fan duty"
+    icon: mdi:fan
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 10
+    initial_value: 100
+    restore_value: false
+    optimistic: true
+    mode: slider
+    set_action:
+      - script.execute:
+          id: send_pct
+          pct: !lambda "return (int) x;"
+
+  # daemon から DGX Spark の温度・消費電力を受け取って表示・ログするだけの入れ物。
+  # ファン制御には使わない (制御は daemon 側で完結)。ここに送られてくる値は
+  # daemon が実際に見ている値そのものなので、M5 側でも同じ数字を見張れる。
+  # internal: true でダッシュボードには出さない (number は仕様上どうしても
+  # min/max の範囲表示が付いてしまうため)。値そのものは下の sensor 側にミラーして表示する。
+  - platform: template
+    id: dgx_temp
+    name: "DGX temp"
+    internal: true
+    icon: mdi:thermometer
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 150
+    step: 0.1
+    mode: box
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "DGX temp report: %.1f C"
+          args: ["x"]
+
+  - platform: template
+    id: dgx_power
+    name: "DGX power"
+    internal: true
+    icon: mdi:flash
+    unit_of_measurement: "W"
+    min_value: 0
+    max_value: 500
+    step: 0.1
+    mode: box
+    optimistic: true
+    set_action:
+      - logger.log:
+          format: "DGX power report: %.1f W"
+          args: ["x"]
+
+button:
+  - platform: template
+    name: "Display toggle"
+    icon: mdi:television-ambient-light
+    on_press:
+      - remote_transmitter.transmit_nec:
+          address: ${nec_address}
+          command: ${nec_display}
+  - platform: template
+    name: "Force 100%"
+    icon: mdi:fan-speed-3
+    on_press:
+      - number.set:
+          id: fan_duty
+          value: 100
+  - platform: restart
+    name: "Restart"
+
+sensor:
+  - platform: template
+    name: "Seconds since last command"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: |-
+      return (millis() - id(last_cmd_ms)) / 1000.0;
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+  # ATOM Lite (ESP32) 自身のチップ内蔵温度。GPU排気の近くに置く等、機器自体の熱を見張りたい場合用。
+  # REST API: GET http://fanblaster.local/sensor/ATOM%20internal%20temperature
+  - platform: internal_temperature
+    name: "ATOM internal temperature"
+    id: atom_internal_temp
+    update_interval: 30s
+  # 上の number (internal: true で非表示) が受け取った最新値を、上限/下限の出ない
+  # 読み取り専用 sensor としてミラー表示する。
+  - platform: template
+    name: "DGX temp"
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(dgx_temp).state;
+  - platform: template
+    name: "DGX power"
+    unit_of_measurement: "W"
+    icon: mdi:flash
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(dgx_power).state;
+
+interval:
+  # 見張り: ホストが黙ったら 100% に戻し、黙り続ける間は timeout ごとに送り直す
+  - interval: 15s
+    then:
+      - lambda: |-
+          uint32_t age = millis() - id(last_cmd_ms);
+          if (age > ${watchdog_timeout_ms}) {
+            ESP_LOGW("fan", "watchdog: no command for %u ms -> forcing 100%%", age);
+            id(fan_duty).publish_state(100);
+            id(send_pct).execute(100);
+          }

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# 実際の秘密情報・実機設定は入れない (テンプレートの *.example のみ commit する)
+esphome/secrets.yaml
+daemon/fanctl.json
+*.bak.*

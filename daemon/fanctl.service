@@ -1,0 +1,27 @@
+[Unit]
+Description=DGX Spark fan control (GPU temperature -> IR fan controller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ssh 鍵を持つユーザーで動かす (root で動かすなら root の ~/.ssh に鍵を置く)
+User=fanctl
+ExecStart=/usr/bin/python3 /opt/fanctl/fanctl.py --config /etc/fanctl.json
+# 落ちても必ず復帰させる
+Restart=always
+RestartSec=5
+# daemon が異常終了して finally が走らなかった場合の保険
+# systemd の unit ファイルは % を specifier として解釈するため %% にエスケープ (実際に送る URL は Fan%20duty)
+ExecStopPost=/usr/bin/curl -fsS -m 5 -X POST "http://fanblaster.local/number/Fan%%20duty/set?value=100"
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# 最小権限
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

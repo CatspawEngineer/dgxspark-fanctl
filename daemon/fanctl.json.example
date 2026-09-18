@@ -1,0 +1,29 @@
+{
+  "nodes": [
+    {"name": "OmoikaneOkami", "ssh": null},
+    {"name": "node2", "ssh": "fanctl@node2"}
+  ],
+  "include_thermal_zones": false,
+  "read_timeout_s": 8,
+
+  "blaster_url": "http://fanblaster.local",
+  "blaster_timeout_s": 5,
+  "m5_temp_sensor_name": "ATOM internal temperature",
+  "report_dgx_metrics_to_m5": true,
+  "m5_report_interval_s": 60,
+
+  "curve": [[10, 30], [40, 50], [70, 80], [90, 100]],
+  "min_duty": 30,
+  "max_duty": 100,
+
+  "safety_temp_c": 80,
+
+  "interval_s": 30,
+  "resend_interval_s": 60,
+  "up_hold_s": 60,
+  "up_step_s": 30,
+
+  "alert_temp": 85,
+  "alert_cycles": 6,
+  "alert_cmd": ""
+}
